@@ -1,0 +1,74 @@
+Agent Platform — Setup Requirements & Instructions
+===================================================
+
+Prerequisites
+-------------
+- Node.js >= 18.x
+- PostgreSQL 16 (local install or Docker)
+- npm (comes with Node.js)
+
+Database Configuration
+----------------------
+The app connects to a local PostgreSQL instance with these defaults:
+
+  Host:     localhost
+  Port:     5432
+  Database: prototype_builder
+  User:     postgres
+  Password: pgadmin
+  Schema:   prototype_builder
+
+Option A: Local PostgreSQL
+  1. Install PostgreSQL 16 and ensure the service is running.
+  2. Create the database:
+       psql -U postgres
+       CREATE DATABASE prototype_builder;
+  3. Run the schema init script:
+       psql -U postgres -d prototype_builder -f backend/scripts/init-schema.sql
+  4. Seed sample data:
+       cd backend && npm run db:seed
+
+Option B: Docker (recommended for quick start)
+  1. From the project root, run:
+       docker-compose up -d
+     This starts PostgreSQL and pgAdmin automatically.
+  2. pgAdmin UI is available at http://localhost:5050
+       Email:    admin@local.dev
+       Password: admin
+  3. Seed sample data:
+       cd backend && npm run db:seed
+
+Backend Setup
+-------------
+  cd backend
+  npm install
+  npm run dev          # starts Express on http://localhost:3000
+
+Frontend Setup
+--------------
+  cd frontend
+  npm install
+  npm run dev          # starts Vite dev server on http://localhost:5173
+
+Environment Files
+-----------------
+  backend/.env         — DB credentials, server port, CORS origin
+  backend/.env.example — template (copy to .env and adjust if needed)
+  frontend/.env.example — API base URL template
+
+Key npm Scripts (backend)
+-------------------------
+  npm run dev       — start dev server with nodemon
+  npm start         — start production server
+  npm run db:seed   — seed the database with sample data
+
+Key npm Scripts (frontend)
+--------------------------
+  npm run dev       — start Vite dev server
+  npm run build     — production build
+  npm run preview   — preview production build
+
+Tech Stack
+----------
+  Backend:  Express 4, PostgreSQL 16, pg driver, Helmet, Morgan
+  Frontend: Vue 3, Vite 5, Pinia, Vue Router, Tailwind CSS, Axios
