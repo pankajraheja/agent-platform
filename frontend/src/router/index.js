@@ -33,6 +33,12 @@ const routes = [
     meta: { title: 'Skills Library' },
   },
   {
+    path: '/skills/:id',
+    name: 'SkillDetail',
+    component: () => import('../views/SkillDetailView.vue'),
+    meta: { title: 'Skill Detail' },
+  },
+  {
     path: '/connectors',
     name: 'Connectors',
     component: () => import('../views/ConnectorsView.vue'),

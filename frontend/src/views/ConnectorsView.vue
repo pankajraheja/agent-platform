@@ -1,45 +1,41 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useConnectorsStore } from '../stores'
 import { useAuthStore } from '../stores/auth'
 import SkeletonLoader from '../components/SkeletonLoader.vue'
-import api from '../api/client'
 
 const store = useConnectorsStore()
 const auth = useAuthStore()
 const router = useRouter()
 
-const instanceMap = ref({})
-
-onMounted(async () => {
-  await store.fetchAll()
-  // Fetch all instances for the user's org to determine which connectors are "connected"
-  if (auth.user?.org_id) {
-    try {
-      const res = await api.get('/connectors', { params: { limit: 200 } })
-      // For each connector, check if there are instances
-      for (const c of store.items) {
-        try {
-          const instRes = await api.get(`/connectors/${c.connector_id}/instances`, {
-            params: { org_id: auth.user.org_id }
-          })
-          if (instRes.data?.length) {
-            instanceMap.value[c.connector_id] = instRes.data.length
-          }
-        } catch { /* ignore */ }
-      }
-    } catch { /* ignore */ }
-  }
-})
+const categoryBadge = (cat) => ({
+  crm:           'bg-blue-100 text-blue-700',
+  ticketing:     'bg-orange-100 text-orange-700',
+  communication: 'bg-green-100 text-green-700',
+  storage:       'bg-purple-100 text-purple-700',
+  analytics:     'bg-indigo-100 text-indigo-700',
+  custom:        'bg-gray-100 text-gray-600',
+}[cat] || 'bg-gray-100 text-gray-600')
 
 function parseAuth(val) {
-  if (Array.isArray(val)) return val.join(', ')
+  if (Array.isArray(val)) return val.map(a => a.replace('_', ' ')).join(', ')
   if (typeof val === 'string') {
-    try { return JSON.parse(val).join(', ') } catch { return val }
+    try { return JSON.parse(val).map(a => a.replace('_', ' ')).join(', ') } catch { return val }
   }
   return '—'
 }
+
+function isConnected(c) {
+  return (store.instanceCounts[c.connector_id] || 0) > 0
+}
+
+onMounted(async () => {
+  await store.fetchAll()
+  if (auth.user?.org_id) {
+    await store.fetchInstanceCounts(auth.user.org_id)
+  }
+})
 </script>
 
 <template>
@@ -61,15 +57,21 @@ function parseAuth(val) {
       >
         <div>
           <div class="flex items-start justify-between mb-2">
-            <h3 class="font-semibold text-sm">{{ c.name }}</h3>
-            <span v-if="instanceMap[c.connector_id]" class="text-green-500 text-sm" title="Connected">
-              ✓ Connected
+            <h3 class="font-semibold text-gray-800">{{ c.name }}</h3>
+            <span
+              class="inline-flex items-center gap-1.5 text-xs font-medium"
+              :class="isConnected(c) ? 'text-green-600' : 'text-gray-400'"
+            >
+              <span
+                class="w-2 h-2 rounded-full"
+                :class="isConnected(c) ? 'bg-green-400' : 'bg-gray-300'"
+              />
+              {{ isConnected(c) ? 'Connected' : 'Not Connected' }}
             </span>
           </div>
-          <p class="text-xs text-gray-500 mb-3">{{ c.provider }}</p>
+          <p class="text-xs text-gray-500 mb-3">{{ c.provider }} &middot; {{ c.type }}</p>
           <div class="flex flex-wrap gap-2">
-            <span class="badge bg-purple-100 text-purple-700">{{ c.category }}</span>
-            <span class="badge bg-gray-100 text-gray-600">{{ c.type }}</span>
+            <span :class="['badge', categoryBadge(c.category)]">{{ c.category }}</span>
           </div>
         </div>
         <div class="mt-3 pt-3 border-t border-gray-100 text-xs text-gray-400">

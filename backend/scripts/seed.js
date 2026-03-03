@@ -10,6 +10,26 @@ async function seed() {
   console.log('🌱 Seeding database...\n');
 
   try {
+    // ----- 0. Schema additions (idempotent) -----
+    await query(`
+      CREATE TABLE IF NOT EXISTS template_skills (
+        template_id     UUID NOT NULL REFERENCES templates(template_id) ON DELETE CASCADE,
+        skill_id        UUID NOT NULL REFERENCES skills(skill_id) ON DELETE CASCADE,
+        execution_order INT DEFAULT 0,
+        PRIMARY KEY (template_id, skill_id)
+      )
+    `);
+    await query(`
+      CREATE TABLE IF NOT EXISTS template_connectors (
+        template_id     UUID NOT NULL REFERENCES templates(template_id) ON DELETE CASCADE,
+        connector_id    UUID NOT NULL REFERENCES connectors(connector_id) ON DELETE CASCADE,
+        execution_order INT DEFAULT 0,
+        PRIMARY KEY (template_id, connector_id)
+      )
+    `);
+    await query(`ALTER TABLE templates DROP CONSTRAINT IF EXISTS templates_category_check`);
+    await query(`ALTER TABLE templates ADD CONSTRAINT templates_category_check CHECK (category IN ('support','sales','ops','hr','finance','custom','analytics','knowledge'))`);
+
     // ----- 1. Default Roles -----
     console.log('  → Roles');
     const roles = [
@@ -103,7 +123,14 @@ async function seed() {
     // ----- 6. Default Connectors -----
     console.log('  → Connectors');
     const connectors = [
-      { name: 'Salesforce',     type: 'saas', provider: 'salesforce',   category: 'crm',           auth_methods: ['oauth2'] },
+      { name: 'Salesforce',     type: 'saas', provider: 'salesforce',   category: 'crm',           auth_methods: ['oauth2'], config_schema: {
+        fields: [
+          { name: 'instance_url', type: 'text', label: 'Salesforce Instance URL', placeholder: 'https://yourcompany.my.salesforce.com', required: true },
+          { name: 'client_id', type: 'text', label: 'Connected App Client ID', required: true },
+          { name: 'client_secret', type: 'password', label: 'Connected App Client Secret', required: true },
+          { name: 'sandbox', type: 'boolean', label: 'Use Sandbox', default: true },
+        ],
+      }},
       { name: 'HubSpot',        type: 'saas', provider: 'hubspot',     category: 'crm',           auth_methods: ['oauth2', 'api_key'] },
       { name: 'Zendesk',        type: 'saas', provider: 'zendesk',     category: 'ticketing',     auth_methods: ['oauth2', 'api_key'] },
       { name: 'Jira',           type: 'saas', provider: 'jira',        category: 'ticketing',     auth_methods: ['oauth2'] },
@@ -118,9 +145,9 @@ async function seed() {
     const connectorIds = {};
     for (const c of connectors) {
       const result = await query(
-        `INSERT INTO connectors (name, type, provider, category, auth_methods)
-         VALUES ($1, $2, $3, $4, $5) RETURNING connector_id`,
-        [c.name, c.type, c.provider, c.category, JSON.stringify(c.auth_methods)]
+        `INSERT INTO connectors (name, type, provider, category, auth_methods, config_schema)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING connector_id`,
+        [c.name, c.type, c.provider, c.category, JSON.stringify(c.auth_methods), JSON.stringify(c.config_schema || {})]
       );
       connectorIds[c.name] = result.rows[0].connector_id;
     }
@@ -168,6 +195,61 @@ async function seed() {
       skillIds[s.name] = result.rows[0].skill_id;
     }
 
+    // ----- 8b. Skill Versions -----
+    console.log('  → Skill versions (Email Drafter + Lead Scorer)');
+
+    // Lead Scorer v1.0.0 (published)
+    await query(
+      `INSERT INTO skill_versions (skill_id, version_number, status, prompt_config, model_settings)
+       VALUES ($1, '1.0.0', 'published', $2, $3)`,
+      [
+        skillIds['Lead Scorer'],
+        JSON.stringify({
+          system_prompt: "You are a B2B lead scoring engine. Analyze the lead's title, company size signals, deal stage, engagement score, and source channel. Return a classification (Hot/Warm/Cold), a confidence score, reasoning, and a recommended next action.",
+          user_template: "Score this lead:\n\nName: {{name}}\nCompany: {{company}}\nTitle: {{title}}\nDeal Value: ${{deal_value}}\nStage: {{stage}}\nEngagement Score: {{lead_score}}/100\nSource: {{source}}\n\nClassify as Hot, Warm, or Cold with reasoning.",
+        }),
+        JSON.stringify({
+          model: 'gpt-4o',
+          temperature: 0.3,
+          max_tokens: 512,
+        }),
+      ]
+    );
+
+    // Email Drafter versions
+    await query(
+      `INSERT INTO skill_versions (skill_id, version_number, status, prompt_config, model_settings)
+       VALUES ($1, '1.0.0', 'published', $2, $3)`,
+      [
+        skillIds['Email Drafter'],
+        JSON.stringify({
+          system_prompt: 'You are a professional email writer for a B2B SaaS company. Write clear, warm, and action-oriented emails. Always include a specific next step or CTA. Keep emails under 200 words.',
+          user_template: 'Write a reply to {{customer_name}} who asked: {{inquiry}}\n\nTone: {{tone}}\nInclude a specific call-to-action.',
+        }),
+        JSON.stringify({
+          model: 'gpt-4o',
+          temperature: 0.7,
+          max_tokens: 1024,
+        }),
+      ]
+    );
+    await query(
+      `INSERT INTO skill_versions (skill_id, version_number, status, prompt_config, model_settings)
+       VALUES ($1, '2.0.0', 'draft', $2, $3)`,
+      [
+        skillIds['Email Drafter'],
+        JSON.stringify({
+          system_prompt: 'You are a professional email writer for a B2B SaaS company. Write clear, warm, and action-oriented emails. Always include a specific next step or CTA. Keep emails under 200 words. Use the customer\'s first name. Reference their specific question in the opening line.',
+          user_template: 'Write a reply to {{customer_name}} regarding: {{inquiry}}\n\nTone: {{tone}}\nMirror the customer\'s language where appropriate.\nInclude a specific, time-bound call-to-action.',
+        }),
+        JSON.stringify({
+          model: 'gpt-4o',
+          temperature: 0.65,
+          max_tokens: 1024,
+        }),
+      ]
+    );
+
     // ----- 9. Persona ↔ Skill recommendations -----
     console.log('  → Persona-skill mappings');
     const personaSkills = [
@@ -189,11 +271,11 @@ async function seed() {
     // ----- 10. Default Templates -----
     console.log('  → Templates');
     const templates = [
-      { name: 'Lead Qualification Agent',   category: 'sales',   tier: 'no-code',  description: 'Automatically scores and qualifies inbound leads from your CRM' },
-      { name: 'Ticket Triage Agent',        category: 'support', tier: 'no-code',  description: 'Classifies, prioritizes, and routes incoming support tickets' },
-      { name: 'Document Q&A Agent',         category: 'ops',     tier: 'no-code',  description: 'Answers questions about uploaded documents using RAG' },
-      { name: 'Weekly Report Generator',    category: 'ops',     tier: 'low-code', description: 'Pulls data from connected sources and generates a weekly summary report' },
-      { name: 'Employee Onboarding Guide',  category: 'hr',      tier: 'no-code',  description: 'Walks new employees through onboarding steps and answers common questions' },
+      { name: 'Lead Qualification Agent',       category: 'sales',     tier: 'no-code',  description: 'Pulls leads from your CRM, scores them by engagement and deal potential, then drafts personalized follow-up emails. Perfect for sales teams who want to prioritize outreach without manual research.' },
+      { name: 'Customer Support Triage Agent',  category: 'support',   tier: 'no-code',  description: 'Classifies incoming support tickets by urgency and category, then routes to the right team with a suggested response.' },
+      { name: 'Document Q&A Agent',             category: 'knowledge', tier: 'no-code',  description: 'Upload company documents and ask questions in natural language. The agent retrieves relevant sections and generates accurate answers with source citations.' },
+      { name: 'Weekly Report Generator',        category: 'analytics', tier: 'low-code', description: 'Connects to your database, pulls key metrics, and generates a formatted executive summary every Monday morning.' },
+      { name: 'Employee Onboarding Guide',      category: 'hr',        tier: 'no-code',  description: 'Walks new employees through onboarding steps and answers common questions' },
     ];
 
     const templateIds = {};
@@ -206,11 +288,42 @@ async function seed() {
       templateIds[t.name] = result.rows[0].template_id;
     }
 
+    // ----- 10b. Template ↔ Skills & Connectors -----
+    console.log('  → Template skills & connectors');
+    const templateLinks = [
+      { template: 'Lead Qualification Agent',
+        skills: [{ name: 'Lead Scorer', order: 1 }, { name: 'Email Drafter', order: 2 }],
+        connectors: [{ name: 'Salesforce', order: 0 }] },
+      { template: 'Customer Support Triage Agent',
+        skills: [{ name: 'Ticket Classifier', order: 1 }, { name: 'Email Drafter', order: 2 }],
+        connectors: [{ name: 'Zendesk', order: 0 }] },
+      { template: 'Weekly Report Generator',
+        skills: [{ name: 'Data Transformer', order: 1 }, { name: 'Report Generator', order: 2 }],
+        connectors: [{ name: 'PostgreSQL', order: 0 }] },
+      { template: 'Document Q&A Agent',
+        skills: [{ name: 'Document Summarizer', order: 1 }],
+        connectors: [{ name: 'SharePoint', order: 0 }] },
+    ];
+    for (const tl of templateLinks) {
+      for (const s of tl.skills) {
+        await query(
+          `INSERT INTO template_skills (template_id, skill_id, execution_order) VALUES ($1, $2, $3)`,
+          [templateIds[tl.template], skillIds[s.name], s.order]
+        );
+      }
+      for (const c of tl.connectors) {
+        await query(
+          `INSERT INTO template_connectors (template_id, connector_id, execution_order) VALUES ($1, $2, $3)`,
+          [templateIds[tl.template], connectorIds[c.name], c.order]
+        );
+      }
+    }
+
     // ----- 11. Persona ↔ Template recommendations -----
     console.log('  → Persona-template mappings');
     const personaTemplates = [
       { persona: 'Sales Rep',         templates: ['Lead Qualification Agent'] },
-      { persona: 'Support Agent',     templates: ['Ticket Triage Agent', 'Document Q&A Agent'] },
+      { persona: 'Support Agent',     templates: ['Customer Support Triage Agent', 'Document Q&A Agent'] },
       { persona: 'Business Analyst',  templates: ['Weekly Report Generator', 'Document Q&A Agent'] },
       { persona: 'HR Specialist',     templates: ['Employee Onboarding Guide'] },
     ];
@@ -257,6 +370,46 @@ async function seed() {
       );
     }
 
+    // ----- 14. Lead Qualification Bot (demo agent) -----
+    console.log('  → Lead Qualification Bot agent');
+
+    // Create a Salesforce connector instance for the demo org
+    const sfInstanceResult = await query(
+      `INSERT INTO connector_instances (connector_id, org_id, name, connection_config, status)
+       VALUES ($1, $2, 'Acme Salesforce (Sandbox)', $3, 'active') RETURNING instance_id`,
+      [
+        connectorIds['Salesforce'],
+        orgId,
+        JSON.stringify({ instance_url: 'https://acme-corp.my.salesforce.com', sandbox: true }),
+      ]
+    );
+    const sfInstanceId = sfInstanceResult.rows[0].instance_id;
+
+    // Create the agent
+    const agentResult = await query(
+      `INSERT INTO agents (workspace_id, name, description, builder_tier, status)
+       VALUES ($1, 'Lead Qualification Bot', 'Pulls leads from Salesforce, scores them, and drafts personalized follow-up emails', 'no-code', 'active')
+       RETURNING agent_id`,
+      [wsId]
+    );
+    const lqAgentId = agentResult.rows[0].agent_id;
+
+    // Link skills to agent
+    await query(
+      `INSERT INTO agent_skills (agent_id, skill_id, execution_order) VALUES ($1, $2, 1)`,
+      [lqAgentId, skillIds['Lead Scorer']]
+    );
+    await query(
+      `INSERT INTO agent_skills (agent_id, skill_id, execution_order) VALUES ($1, $2, 2)`,
+      [lqAgentId, skillIds['Email Drafter']]
+    );
+
+    // Link Salesforce connector instance to agent
+    await query(
+      `INSERT INTO agent_connectors (agent_id, instance_id, purpose) VALUES ($1, $2, 'Pull lead data')`,
+      [lqAgentId, sfInstanceId]
+    );
+
     console.log('\n✅ Seed complete!');
     console.log(`   Org: ${orgId}`);
     console.log(`   Workspace: ${wsId}`);
@@ -264,6 +417,7 @@ async function seed() {
     console.log(`   Connectors: ${Object.keys(connectorIds).length}`);
     console.log(`   Skills: ${Object.keys(skillIds).length}`);
     console.log(`   Templates: ${Object.keys(templateIds).length}`);
+    console.log(`   Agent: Lead Qualification Bot (${lqAgentId})`);
 
   } catch (err) {
     console.error('❌ Seed failed:', err);

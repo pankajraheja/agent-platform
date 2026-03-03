@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 import { useToast } from '../composables/useToast'
@@ -15,7 +15,6 @@ const agentId = route.params.id
 const agent = ref(null)
 const skills = ref([])
 const connectors = ref([])
-const versions = ref([])
 const runs = ref([])
 const loading = ref(true)
 const activeTab = ref('overview')
@@ -24,6 +23,7 @@ const activeTab = ref('overview')
 const runningAgent = ref(false)
 const expandedRunId = ref(null)
 const runSteps = ref({})
+const expandedStepRaw = ref({}) // track which steps show raw JSON
 
 // Modals
 const showSkillModal = ref(false)
@@ -31,17 +31,20 @@ const showConnectorModal = ref(false)
 const allSkills = ref([])
 const allConnectors = ref([])
 
-// Inline edit
-const editingName = ref(false)
-const editName = ref('')
+const tierBadgeClass = (tier) => ({
+  'no-code': 'bg-green-100 text-green-700',
+  'low-code': 'bg-orange-100 text-orange-700',
+  'pro-code': 'bg-red-100 text-red-700',
+}[tier] || 'bg-gray-100 text-gray-600')
 
-const tierBadge = (tier) => ({
-  'no-code': 'badge-nocode',
-  'low-code': 'badge-lowcode',
-  'pro-code': 'badge-procode',
-}[tier] || '')
+const statusBadgeClass = (status) => ({
+  active: 'bg-green-100 text-green-700',
+  draft: 'bg-gray-100 text-gray-600',
+  paused: 'bg-yellow-100 text-yellow-700',
+  retired: 'bg-red-100 text-red-600',
+}[status] || 'bg-gray-100 text-gray-600')
 
-const statusColor = (status) => ({
+const statusDot = (status) => ({
   active: 'bg-green-400',
   draft: 'bg-gray-300',
   paused: 'bg-yellow-400',
@@ -49,38 +52,45 @@ const statusColor = (status) => ({
   running: 'bg-blue-400',
   completed: 'bg-green-400',
   failed: 'bg-red-400',
-  awaiting_human: 'bg-yellow-400',
 }[status] || 'bg-gray-300')
 
-const stepStatusColor = (status) => ({
-  success: 'bg-green-500',
-  failed: 'bg-red-500',
-  skipped: 'bg-gray-400',
-  timeout: 'bg-yellow-500',
-}[status] || 'bg-gray-400')
+const stepBorder = (status) => ({
+  success: 'border-l-green-500',
+  failed: 'border-l-red-500',
+  skipped: 'border-l-gray-400',
+  timeout: 'border-l-yellow-500',
+}[status] || 'border-l-gray-300')
 
 const stepTypeBadge = (type) => ({
   skill: 'bg-blue-100 text-blue-700',
   connector: 'bg-purple-100 text-purple-700',
   llm_call: 'bg-amber-100 text-amber-700',
-  decision: 'bg-teal-100 text-teal-700',
-  human_gate: 'bg-orange-100 text-orange-700',
 }[type] || 'bg-gray-100 text-gray-600')
+
+// Build execution pipeline — connectors first (step 0), then skills by execution_order
+const pipeline = computed(() => {
+  const steps = []
+  for (const c of connectors.value) {
+    steps.push({ type: 'connector', name: c.connector_name || c.name, description: c.purpose || 'Pull data', icon: '🔌', category: c.category })
+  }
+  for (const s of skills.value) {
+    steps.push({ type: 'skill', name: s.name, description: s.description, icon: '⚡', category: s.category, order: s.execution_order })
+  }
+  return steps
+})
 
 async function fetchAgent() {
   loading.value = true
   try {
-    const [agentRes, skillsRes, connectorsRes, versionsRes, runsRes] = await Promise.all([
+    const [agentRes, skillsRes, connectorsRes, runsRes] = await Promise.all([
       api.get(`/agents/${agentId}`),
       api.get(`/agents/${agentId}/skills`),
       api.get(`/agents/${agentId}/connectors`),
-      api.get(`/agents/${agentId}/versions`),
-      api.get(`/runs`, { params: { agent_id: agentId, limit: 20 } }),
+      api.get(`/runs`, { params: { agent_id: agentId, limit: 20, orderBy: 'started_at DESC' } }),
     ])
     agent.value = agentRes.data
     skills.value = skillsRes.data
     connectors.value = connectorsRes.data
-    versions.value = versionsRes.data
     runs.value = runsRes.data
   } catch (err) {
     console.error('Failed to load agent:', err)
@@ -99,13 +109,13 @@ async function runAgent() {
     const { run, steps } = res.data
 
     // Refresh runs list
-    const runsRes = await api.get(`/runs`, { params: { agent_id: agentId, limit: 20 } })
+    const runsRes = await api.get(`/runs`, { params: { agent_id: agentId, limit: 20, orderBy: 'started_at DESC' } })
     runs.value = runsRes.data
 
     // Cache the steps for the new run
     runSteps.value[run.run_id] = steps
 
-    showToast(`Run complete — ${steps.length} steps, ${run.total_tokens?.toLocaleString()} tokens, ${(run.duration_ms / 1000).toFixed(1)}s`, 'success', 5000)
+    showToast(`Agent completed — ${steps.length} steps, ${run.total_tokens?.toLocaleString()} tokens, ${(run.duration_ms / 1000).toFixed(1)}s`, 'success', 5000)
 
     // Switch to runs tab and expand the new run
     activeTab.value = 'runs'
@@ -118,36 +128,50 @@ async function runAgent() {
   }
 }
 
-async function toggleRunExpand(run) {
-  if (expandedRunId.value === run.run_id) {
+async function toggleRunExpand(r) {
+  if (expandedRunId.value === r.run_id) {
     expandedRunId.value = null
     return
   }
-  expandedRunId.value = run.run_id
-  if (!runSteps.value[run.run_id]) {
+  expandedRunId.value = r.run_id
+  if (!runSteps.value[r.run_id]) {
     try {
-      const res = await api.get(`/runs/${run.run_id}/steps`)
-      runSteps.value[run.run_id] = res.data
+      const res = await api.get(`/runs/${r.run_id}/steps`)
+      runSteps.value[r.run_id] = res.data
     } catch (err) {
       console.error('Failed to load steps:', err)
     }
   }
 }
 
-function startEditName() {
-  editName.value = agent.value.name
-  editingName.value = true
+function toggleStepRaw(stepId) {
+  expandedStepRaw.value = { ...expandedStepRaw.value, [stepId]: !expandedStepRaw.value[stepId] }
 }
 
-async function saveName() {
-  if (!editName.value.trim()) return
-  try {
-    const res = await api.put(`/agents/${agentId}`, { name: editName.value.trim() })
-    agent.value = res.data
-  } catch (err) {
-    console.error('Failed to update name:', err)
+// Step summary helpers
+function stepSummary(step) {
+  const output = typeof step.output === 'string' ? JSON.parse(step.output) : step.output
+  if (!output) return null
+
+  if (step.step_type === 'connector' && output.name) {
+    return `Pulled: ${output.name} @ ${output.company} ($${output.deal_value?.toLocaleString()})`
   }
-  editingName.value = false
+  if (output.classification) {
+    return `${output.classification} (${Math.round(output.confidence * 100)}% confidence) — ${output.recommended_action}`
+  }
+  if (output.subject) {
+    return `Subject: "${output.subject}" — ${output.word_count} words, ${output.tone}`
+  }
+  if (output.result) return output.result
+  if (output.records_fetched) return `${output.records_fetched} records fetched`
+  return null
+}
+
+function parseOutput(step) {
+  if (typeof step.output === 'string') {
+    try { return JSON.parse(step.output) } catch { return step.output }
+  }
+  return step.output
 }
 
 async function openSkillModal() {
@@ -162,15 +186,24 @@ async function linkSkill(skill) {
   try {
     await api.post(`/agents/${agentId}/skills`, {
       skill_id: skill.skill_id,
-      execution_order: skills.value.length,
+      execution_order: skills.value.length + 1,
     })
     const res = await api.get(`/agents/${agentId}/skills`)
     skills.value = res.data
     showSkillModal.value = false
     showToast(`Linked skill "${skill.name}"`, 'success')
   } catch (err) {
-    console.error('Link skill failed:', err)
     showToast('Failed to link skill', 'error')
+  }
+}
+
+async function unlinkSkill(skill) {
+  try {
+    await api.delete(`/agents/${agentId}/skills/${skill.skill_id}`)
+    skills.value = skills.value.filter(s => s.skill_id !== skill.skill_id)
+    showToast(`Removed "${skill.name}"`, 'info')
+  } catch (err) {
+    showToast('Failed to remove skill', 'error')
   }
 }
 
@@ -182,15 +215,14 @@ async function openConnectorModal() {
   } catch (err) { console.error(err) }
 }
 
-async function promoteVersion(version) {
+async function unlinkConnector(conn) {
   try {
-    await api.put(`/agents/${agentId}/versions`, {
-      ...version,
-      status: 'published',
-    })
-    const res = await api.get(`/agents/${agentId}/versions`)
-    versions.value = res.data
-  } catch (err) { console.error('Promote failed:', err) }
+    await api.delete(`/agents/${agentId}/connectors/${conn.instance_id}`)
+    connectors.value = connectors.value.filter(c => c.instance_id !== conn.instance_id)
+    showToast(`Removed "${conn.connector_name}"`, 'info')
+  } catch (err) {
+    showToast('Failed to remove connector', 'error')
+  }
 }
 
 onMounted(fetchAgent)
@@ -218,22 +250,12 @@ onMounted(fetchAgent)
 
     <!-- Header -->
     <div class="flex items-center justify-between">
-      <div class="flex items-center gap-3">
-        <div v-if="editingName" class="flex items-center gap-2">
-          <input
-            v-model="editName"
-            class="text-xl font-bold border border-brand-300 rounded px-2 py-1 focus:outline-none focus:ring-2 focus:ring-brand-500"
-            @keyup.enter="saveName"
-            @keyup.escape="editingName = false"
-          />
-          <button class="btn-primary text-xs" @click="saveName">Save</button>
-          <button class="text-xs text-gray-400" @click="editingName = false">Cancel</button>
-        </div>
-        <h1
-          v-else
-          class="text-xl font-bold text-gray-800 cursor-pointer hover:text-brand-600"
-          @click="startEditName"
-        >{{ agent.name }}</h1>
+      <div>
+        <h1 class="text-xl font-bold text-gray-800">{{ agent.name }}</h1>
+        <p v-if="agent.description" class="text-sm text-gray-500 mt-1">{{ agent.description }}</p>
+        <p v-if="agent.metadata?.forked_from" class="text-xs text-gray-400 mt-1 inline-flex items-center gap-1">
+          &#128260; Forked from template
+        </p>
       </div>
       <div class="flex items-center gap-3">
         <button
@@ -248,21 +270,16 @@ onMounted(fetchAgent)
           <span v-else>&#9654;</span>
           {{ runningAgent ? 'Running...' : 'Run Agent' }}
         </button>
-        <span class="inline-flex items-center gap-1.5">
-          <span :class="['w-2 h-2 rounded-full', statusColor(agent.status)]" />
-          <span class="text-sm text-gray-600">{{ agent.status }}</span>
-        </span>
-        <span :class="['badge', tierBadge(agent.builder_tier)]">{{ agent.builder_tier }}</span>
+        <span :class="['badge', statusBadgeClass(agent.status)]">{{ agent.status }}</span>
+        <span :class="['badge', tierBadgeClass(agent.builder_tier)]">{{ agent.builder_tier }}</span>
       </div>
     </div>
-
-    <p v-if="agent.description" class="text-sm text-gray-500">{{ agent.description }}</p>
 
     <!-- Tabs -->
     <div class="border-b border-gray-200">
       <nav class="flex gap-6">
         <button
-          v-for="tab in ['overview', 'versions', 'runs']"
+          v-for="tab in ['overview', 'runs']"
           :key="tab"
           :class="[
             'pb-3 text-sm font-medium border-b-2 transition-colors capitalize',
@@ -276,156 +293,178 @@ onMounted(fetchAgent)
     </div>
 
     <!-- TAB 1: Overview -->
-    <div v-if="activeTab === 'overview'" class="space-y-6">
-      <!-- Linked Skills -->
-      <div class="card">
-        <div class="flex items-center justify-between mb-4">
-          <h2 class="text-base font-semibold">Linked Skills</h2>
-          <button class="btn-secondary text-xs" @click="openSkillModal">+ Add Skill</button>
-        </div>
-        <div v-if="skills.length" class="space-y-2">
-          <div
-            v-for="(s, i) in skills"
-            :key="s.skill_id"
-            class="flex items-center justify-between py-2 border-b border-gray-100 last:border-0"
-          >
-            <div class="flex items-center gap-3">
-              <span class="text-xs font-bold text-gray-400 w-6">{{ i + 1 }}</span>
-              <div>
-                <p class="text-sm font-medium">{{ s.name }}</p>
-                <p class="text-xs text-gray-400">{{ s.description }}</p>
+    <div v-if="activeTab === 'overview'" class="grid grid-cols-12 gap-6">
+      <!-- Left: Execution Pipeline -->
+      <div class="col-span-7">
+        <div class="card">
+          <h2 class="text-base font-semibold mb-4">Execution Pipeline</h2>
+
+          <div v-if="pipeline.length" class="space-y-0">
+            <div v-for="(step, idx) in pipeline" :key="idx">
+              <!-- Step card -->
+              <div class="flex items-center gap-4 p-3 rounded-lg border border-gray-200 bg-white">
+                <div class="flex-shrink-0 w-8 h-8 rounded-full bg-gray-100 flex items-center justify-center text-lg">
+                  {{ step.icon }}
+                </div>
+                <div class="flex-1 min-w-0">
+                  <div class="flex items-center gap-2">
+                    <span class="text-xs font-bold text-gray-400">Step {{ idx }}</span>
+                    <span :class="['badge text-[10px]', stepTypeBadge(step.type)]">{{ step.type }}</span>
+                    <span class="text-sm font-medium">{{ step.name }}</span>
+                  </div>
+                  <p class="text-xs text-gray-400 mt-0.5 truncate">{{ step.description }}</p>
+                </div>
+                <span :class="['badge text-[10px]', step.type === 'connector' ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700']">{{ step.category }}</span>
+              </div>
+
+              <!-- Arrow connector -->
+              <div v-if="idx < pipeline.length - 1" class="flex justify-center py-1">
+                <div class="w-0.5 h-6 bg-gray-300 relative">
+                  <div class="absolute -bottom-1 left-1/2 -translate-x-1/2 text-gray-300 text-xs">&#9660;</div>
+                </div>
               </div>
             </div>
-            <span class="badge bg-blue-100 text-blue-700">{{ s.category }}</span>
+          </div>
+
+          <div v-else class="text-center py-8">
+            <p class="text-2xl mb-2">🔗</p>
+            <p class="text-sm text-gray-400">No steps configured. Add skills and connectors to build your pipeline.</p>
           </div>
         </div>
-        <p v-else class="text-sm text-gray-400">No skills linked yet.</p>
       </div>
 
-      <!-- Linked Connectors -->
-      <div class="card">
-        <div class="flex items-center justify-between mb-4">
-          <h2 class="text-base font-semibold">Linked Connectors</h2>
-          <button class="btn-secondary text-xs" @click="openConnectorModal">+ Add Connector</button>
-        </div>
-        <div v-if="connectors.length" class="space-y-2">
-          <div
-            v-for="c in connectors"
-            :key="c.instance_id"
-            class="flex items-center justify-between py-2 border-b border-gray-100 last:border-0"
-          >
-            <div>
-              <p class="text-sm font-medium">{{ c.connector_name || c.name }}</p>
-              <p class="text-xs text-gray-400">{{ c.provider }} &middot; {{ c.purpose || 'General' }}</p>
-            </div>
-            <span class="badge bg-purple-100 text-purple-700">{{ c.category }}</span>
+      <!-- Right: Agent Configuration -->
+      <div class="col-span-5 space-y-6">
+        <!-- Linked Skills -->
+        <div class="card">
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="text-sm font-semibold">Linked Skills</h3>
+            <button class="btn-secondary text-xs" @click="openSkillModal">+ Add</button>
           </div>
-        </div>
-        <p v-else class="text-sm text-gray-400">No connectors linked yet.</p>
-      </div>
-    </div>
-
-    <!-- TAB 2: Versions -->
-    <div v-if="activeTab === 'versions'">
-      <div class="card">
-        <div v-if="versions.length" class="divide-y divide-gray-100">
-          <div
-            v-for="v in versions"
-            :key="v.version_id"
-            class="flex items-center justify-between py-3"
-          >
-            <div>
-              <p class="text-sm font-medium">v{{ v.version_number }}</p>
-              <p class="text-xs text-gray-400">{{ new Date(v.created_at).toLocaleString() }}</p>
-            </div>
-            <div class="flex items-center gap-3">
-              <span :class="['badge', v.status === 'published' ? 'bg-green-100 text-green-700' : v.status === 'draft' ? 'bg-gray-100 text-gray-600' : 'bg-red-100 text-red-600']">
-                {{ v.status }}
-              </span>
-              <button
-                v-if="v.status === 'draft'"
-                class="btn-primary text-xs"
-                @click="promoteVersion(v)"
-              >Publish</button>
-            </div>
-          </div>
-        </div>
-        <p v-else class="text-sm text-gray-400">No versions yet.</p>
-      </div>
-    </div>
-
-    <!-- TAB 3: Runs -->
-    <div v-if="activeTab === 'runs'">
-      <div class="card">
-        <div v-if="runs.length" class="divide-y divide-gray-100">
-          <div v-for="r in runs" :key="r.run_id">
-            <!-- Run row -->
+          <div v-if="skills.length" class="space-y-2">
             <div
-              class="flex items-center justify-between py-3 cursor-pointer hover:bg-gray-50 px-2 -mx-2 rounded-lg transition-colors"
-              @click="toggleRunExpand(r)"
+              v-for="s in skills"
+              :key="s.skill_id"
+              class="flex items-center justify-between py-2 border-b border-gray-100 last:border-0"
             >
-              <div class="flex items-center gap-3">
-                <span
-                  class="text-gray-400 text-xs transition-transform"
-                  :class="expandedRunId === r.run_id ? 'rotate-90' : ''"
-                >&#9654;</span>
+              <div class="flex items-center gap-2">
+                <span class="text-xs font-bold text-gray-400 w-5">{{ s.execution_order }}</span>
                 <div>
-                  <p class="text-sm font-mono">{{ r.run_id?.substring(0, 8) }}...</p>
-                  <p class="text-xs text-gray-400">{{ r.trigger_type || 'manual' }} &middot; {{ new Date(r.started_at).toLocaleString() }}</p>
+                  <p class="text-sm font-medium">{{ s.name }}</p>
+                  <p class="text-xs text-gray-400">{{ s.category }}</p>
                 </div>
               </div>
-              <div class="flex items-center gap-4 text-sm">
-                <span class="text-xs text-gray-400">{{ r.duration_ms ? `${(r.duration_ms / 1000).toFixed(1)}s` : '—' }}</span>
-                <span class="text-xs text-gray-400">{{ r.total_tokens?.toLocaleString() || 0 }} tokens</span>
-                <span class="inline-flex items-center gap-1.5">
-                  <span :class="['w-2 h-2 rounded-full', statusColor(r.status)]" />
-                  {{ r.status }}
-                </span>
-              </div>
-            </div>
-
-            <!-- Expanded: Step timeline -->
-            <div v-if="expandedRunId === r.run_id" class="pl-8 pr-2 pb-4 pt-1">
-              <div v-if="runSteps[r.run_id]?.length" class="relative">
-                <!-- Vertical line -->
-                <div class="absolute left-[7px] top-2 bottom-2 w-0.5 bg-gray-200" />
-
-                <div
-                  v-for="(step, idx) in runSteps[r.run_id]"
-                  :key="step.step_id"
-                  class="relative flex items-start gap-4 pb-4 last:pb-0"
-                >
-                  <!-- Dot -->
-                  <div class="relative z-10 flex-shrink-0">
-                    <div :class="['w-4 h-4 rounded-full border-2 border-white shadow-sm', stepStatusColor(step.status)]" />
-                  </div>
-
-                  <!-- Step content -->
-                  <div class="flex-1 min-w-0">
-                    <div class="flex items-center justify-between">
-                      <div class="flex items-center gap-2">
-                        <span class="text-xs font-bold text-gray-400">Step {{ idx + 1 }}</span>
-                        <span :class="['badge text-[10px]', stepTypeBadge(step.step_type)]">{{ step.step_type }}</span>
-                        <span class="text-sm font-medium">{{ step.name || step.input?.skill_name || step.input?.connector_name || '—' }}</span>
-                      </div>
-                      <div class="flex items-center gap-3 text-xs text-gray-400">
-                        <span>{{ step.tokens_used }} tokens</span>
-                        <span>{{ step.duration_ms }}ms</span>
-                        <span :class="step.status === 'success' ? 'text-green-600' : 'text-red-600'">{{ step.status }}</span>
-                      </div>
-                    </div>
-                    <p class="text-xs text-gray-400 mt-0.5">
-                      {{ new Date(step.executed_at).toLocaleTimeString() }}
-                      <span v-if="step.output?.result" class="ml-2 text-gray-500">&mdash; {{ step.output.result }}</span>
-                    </p>
-                  </div>
-                </div>
-              </div>
-              <p v-else class="text-xs text-gray-400">No steps recorded for this run.</p>
+              <button class="text-xs text-red-400 hover:text-red-600" @click="unlinkSkill(s)">Remove</button>
             </div>
           </div>
+          <p v-else class="text-xs text-gray-400">No skills linked.</p>
         </div>
-        <p v-else class="text-sm text-gray-400">No runs yet for this agent.</p>
+
+        <!-- Linked Connectors -->
+        <div class="card">
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="text-sm font-semibold">Linked Connectors</h3>
+            <button class="btn-secondary text-xs" @click="openConnectorModal">+ Add</button>
+          </div>
+          <div v-if="connectors.length" class="space-y-2">
+            <div
+              v-for="c in connectors"
+              :key="c.instance_id"
+              class="flex items-center justify-between py-2 border-b border-gray-100 last:border-0"
+            >
+              <div>
+                <p class="text-sm font-medium">{{ c.connector_name || c.name }}</p>
+                <p class="text-xs text-gray-400">{{ c.provider }} &middot; {{ c.purpose || 'General' }}</p>
+              </div>
+              <button class="text-xs text-red-400 hover:text-red-600" @click="unlinkConnector(c)">Remove</button>
+            </div>
+          </div>
+          <p v-else class="text-xs text-gray-400">No connectors linked.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 2: Runs -->
+    <div v-if="activeTab === 'runs'">
+      <div v-if="runs.length" class="space-y-3">
+        <div v-for="r in runs" :key="r.run_id" class="card p-0 overflow-hidden">
+          <!-- Run header row -->
+          <div
+            class="flex items-center justify-between px-5 py-3 cursor-pointer hover:bg-gray-50 transition-colors"
+            @click="toggleRunExpand(r)"
+          >
+            <div class="flex items-center gap-3">
+              <span
+                class="text-gray-400 text-xs transition-transform"
+                :class="expandedRunId === r.run_id ? 'rotate-90' : ''"
+              >&#9654;</span>
+              <div>
+                <p class="text-sm font-mono font-medium">Run #{{ r.run_id?.substring(0, 8) }}...</p>
+                <p class="text-xs text-gray-400">{{ r.trigger_type || 'manual' }} &middot; {{ new Date(r.started_at).toLocaleString() }}</p>
+              </div>
+            </div>
+            <div class="flex items-center gap-4 text-sm">
+              <span class="text-xs text-gray-500 font-mono">{{ r.duration_ms ? `${(r.duration_ms / 1000).toFixed(1)}s` : '—' }}</span>
+              <span class="text-xs text-gray-500 font-mono">{{ r.total_tokens?.toLocaleString() || 0 }} tokens</span>
+              <span class="inline-flex items-center gap-1.5">
+                <span :class="['w-2 h-2 rounded-full', statusDot(r.status)]" />
+                <span class="text-sm">{{ r.status }}</span>
+              </span>
+            </div>
+          </div>
+
+          <!-- Expanded: Step trace -->
+          <div v-if="expandedRunId === r.run_id" class="border-t border-gray-100 bg-gray-50/50 px-5 py-4">
+            <div v-if="runSteps[r.run_id]?.length" class="space-y-3">
+              <div
+                v-for="(step, idx) in runSteps[r.run_id]"
+                :key="step.step_id"
+                :class="['border-l-4 rounded-lg bg-white p-4 shadow-sm', stepBorder(step.status)]"
+              >
+                <!-- Step header -->
+                <div class="flex items-center justify-between">
+                  <div class="flex items-center gap-2">
+                    <span class="text-xs font-bold text-gray-400">Step {{ step.step_number || idx + 1 }}</span>
+                    <span class="text-base">{{ step.step_type === 'connector' ? '🔌' : '⚡' }}</span>
+                    <span :class="['badge text-[10px]', stepTypeBadge(step.step_type)]">{{ step.step_type }}</span>
+                    <span class="text-sm font-semibold">{{ step.name || '—' }}</span>
+                  </div>
+                  <div class="flex items-center gap-3 text-xs">
+                    <span class="text-gray-400 font-mono">{{ step.duration_ms }}ms</span>
+                    <span class="text-gray-400 font-mono">{{ step.tokens_used }}t</span>
+                    <span :class="step.status === 'success' ? 'text-green-600 font-medium' : 'text-red-600 font-medium'">
+                      {{ step.status === 'success' ? '&#10003;' : '&#10007;' }} {{ step.status }}
+                    </span>
+                  </div>
+                </div>
+
+                <!-- Step summary -->
+                <p v-if="stepSummary(step)" class="text-sm text-gray-600 mt-2 leading-relaxed">
+                  &rarr; {{ stepSummary(step) }}
+                </p>
+
+                <!-- Show Raw Output toggle -->
+                <div class="mt-2">
+                  <button
+                    class="text-xs text-brand-600 hover:text-brand-800 font-medium"
+                    @click.stop="toggleStepRaw(step.step_id)"
+                  >
+                    {{ expandedStepRaw[step.step_id] ? 'Hide Raw Output' : 'Show Raw Output' }}
+                  </button>
+                  <pre
+                    v-if="expandedStepRaw[step.step_id]"
+                    class="mt-2 bg-gray-900 text-green-300 rounded-lg p-3 text-xs whitespace-pre-wrap overflow-x-auto max-h-[300px] overflow-y-auto"
+                  >{{ JSON.stringify(parseOutput(step), null, 2) }}</pre>
+                </div>
+              </div>
+            </div>
+            <p v-else class="text-xs text-gray-400">No steps recorded for this run.</p>
+          </div>
+        </div>
+      </div>
+      <div v-else class="card text-center py-12">
+        <p class="text-2xl mb-2">🏃</p>
+        <p class="text-sm text-gray-400">No runs yet. Click "Run Agent" to execute the pipeline.</p>
       </div>
     </div>
 
